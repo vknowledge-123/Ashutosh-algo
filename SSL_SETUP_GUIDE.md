@@ -1,284 +1,542 @@
-# SSL/HTTPS Setup Guide
+# GCP Deployment Guide
 
-This guide explains how to enable HTTPS for your trading application so that Zerodha and other services accept your webhook URLs.
+This guide shows how to deploy the FastAPI trading app on Google Cloud without a domain name, using:
 
-## Quick Start (Testing)
+- A Compute Engine VM
+- A reserved static external IP
+- HTTPS on the public IP address
+- nginx as reverse proxy
+- `systemd` for process management
 
-For local testing or development, use self-signed certificates:
+You will access the app with an IP URL such as:
 
-### Step 1: Generate Self-Signed Certificate
-
-```bash
-# Activate virtual environment
-myvenv\Scripts\activate
-
-# Generate SSL certificate
-python generate_ssl_cert.py
+```text
+https://YOUR_STATIC_IP/?user_id=1
 ```
 
-This creates:
-- `ssl_cert.pem` - SSL certificate
-- `ssl_key.pem` - Private key
+Your webhook URL will be:
 
-### Step 2: Start HTTPS Server
-
-```bash
-# Windows
-start_https.bat
-
-# Or manually
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --ssl-keyfile=ssl_key.pem --ssl-certfile=ssl_cert.pem
+```text
+https://YOUR_STATIC_IP/webhook/chartink?user_id=1
 ```
 
-### Step 3: Access Dashboard
+## Important Notes
 
-Open your browser to:
-- `https://localhost:8000/?user_id=1`
-- `https://134.195.138.91:8000/?user_id=1`
+1. You do not need a domain for this setup.
+2. As of January 15, 2026, Let's Encrypt supports public IP address certificates.
+3. IP certificates are short-lived, about 6 days, so auto-renewal is mandatory.
+4. Google-managed SSL certificates for load balancers are still domain/DNS based. For an IP-only setup, terminate TLS directly on the VM with nginx.
+5. If a third-party webhook provider refuses bare-IP URLs for policy reasons, you will still need a domain even if HTTPS itself is valid.
 
-**Note**: You'll see a security warning because it's a self-signed certificate. Click "Advanced" → "Proceed to site" to continue.
+---
 
-### Webhook URL
+## Recommended Architecture
 
-Your webhook URL for Chartink/Zerodha:
-```
-https://134.195.138.91:8000/webhook/chartink?user_id=1
+```text
+Internet
+   |
+HTTPS :443
+   |
+GCP Static External IP
+   |
+nginx
+   |
+http://127.0.0.1:8000
+   |
+uvicorn app.main:app
 ```
 
 ---
 
-## Production Setup (Let's Encrypt - FREE)
+## Step 1: Reserve a Static External IP
 
-> **⚠️ IMPORTANT**: Self-signed certificates may not work with Zerodha webhooks. For production, use Let's Encrypt (free, trusted certificates).
+Choose your region first. Example:
 
-### Prerequisites
+- Region: `asia-south1`
+- Zone: `asia-south1-a`
 
-- Domain name pointing to your server IP (e.g., `trading.yourdomain.com`)
-- SSH access to your VPS server
-- Port 80 and 443 open in firewall
-
-### Step 1: Install Certbot
-
-SSH into your server:
+Reserve the IP:
 
 ```bash
-ssh root@134.195.138.91
+gcloud compute addresses create trading-ip \
+  --region=asia-south1
 ```
 
-Install Certbot (for Ubuntu/Debian):
+Get the reserved IP:
 
 ```bash
-# Update package list
+gcloud compute addresses describe trading-ip \
+  --region=asia-south1 \
+  --format="get(address)"
+```
+
+Save that value as `YOUR_STATIC_IP`.
+
+---
+
+## Step 2: Create the VM and Attach the Static IP
+
+Create an Ubuntu VM:
+
+```bash
+gcloud compute instances create trading-vm \
+  --zone=asia-south1-a \
+  --machine-type=e2-medium \
+  --address=YOUR_STATIC_IP \
+  --tags=trading-server \
+  --image-family=ubuntu-2204-lts \
+  --image-project=ubuntu-os-cloud \
+  --boot-disk-size=30GB
+```
+
+If the VM already exists, you can reassign the reserved IP later from the GCP console or by removing the old access config and adding the reserved address.
+
+---
+
+## Step 3: Open Firewall Ports
+
+Allow web traffic:
+
+```bash
+gcloud compute firewall-rules create trading-allow-web \
+  --allow=tcp:80,tcp:443 \
+  --source-ranges=0.0.0.0/0 \
+  --target-tags=trading-server
+```
+
+Allow SSH. Replace `YOUR_PUBLIC_IP` with your office/home public IP:
+
+```bash
+gcloud compute firewall-rules create trading-allow-ssh \
+  --allow=tcp:22 \
+  --source-ranges=YOUR_PUBLIC_IP/32 \
+  --target-tags=trading-server
+```
+
+If you need temporary open SSH access for setup, you can widen it and tighten it later.
+
+---
+
+## Step 4: SSH Into the VM
+
+```bash
+gcloud compute ssh trading-vm --zone=asia-south1-a
+```
+
+---
+
+## Step 5: Install System Packages
+
+On the VM:
+
+```bash
 sudo apt update
-
-# Install Certbot and required packages
-sudo apt install certbot python3-certbot-nginx -y
+sudo apt install -y python3 python3-venv python3-pip git nginx redis-server snapd
 ```
 
-For other Linux distributions, see: https://certbot.eff.org/
-
-### Step 2: Obtain SSL Certificate
+Install Certbot from snap so you get a recent enough version for IP certificates:
 
 ```bash
-# Stop your application if running
-# (Let's Encrypt needs port 80 temporarily)
-
-# Obtain certificate
-sudo certbot certonly --standalone -d trading.yourdomain.com
-
-# Follow the prompts:
-# - Enter your email address
-# - Agree to terms of service
-# - Choose whether to share email with EFF
-```
-
-Certificates will be saved to:
-- Certificate: `/etc/letsencrypt/live/trading.yourdomain.com/fullchain.pem`
-- Private Key: `/etc/letsencrypt/live/trading.yourdomain.com/privkey.pem`
-
-### Step 3: Update Application
-
-Edit your startup script to use Let's Encrypt certificates:
-
-```bash
-python -m uvicorn app.main:app \
-  --host 0.0.0.0 \
-  --port 443 \
-  --ssl-keyfile=/etc/letsencrypt/live/trading.yourdomain.com/privkey.pem \
-  --ssl-certfile=/etc/letsencrypt/live/trading.yourdomain.com/fullchain.pem
-```
-
-**Note**: Port 443 requires root/sudo access. Run with sudo:
-
-```bash
-sudo /path/to/myvenv/bin/python -m uvicorn app.main:app \
-  --host 0.0.0.0 \
-  --port 443 \
-  --ssl-keyfile=/etc/letsencrypt/live/trading.yourdomain.com/privkey.pem \
-  --ssl-certfile=/etc/letsencrypt/live/trading.yourdomain.com/fullchain.pem
-```
-
-### Step 4: Auto-Renewal
-
-Let's Encrypt certificates expire after 90 days. Set up auto-renewal:
-
-```bash
-# Test renewal process
-sudo certbot renew --dry-run
-
-# If successful, renewal will happen automatically via cron
-# Check with:
-sudo systemctl status certbot.timer
-```
-
-### Step 5: Configure Webhook
-
-Update your Zerodha/Chartink webhook URL to:
-```
-https://trading.yourdomain.com/webhook/chartink?user_id=1
+sudo snap install core
+sudo snap refresh core
+sudo snap install --classic certbot
+sudo ln -sf /snap/bin/certbot /usr/bin/certbot
+certbot --version
 ```
 
 ---
 
-## Using nginx as Reverse Proxy (Recommended)
+## Step 6: Deploy the App Code
 
-For production, it's recommended to use nginx as a reverse proxy:
+Clone the repository and install Python dependencies:
 
-### Benefits
-- Handles SSL termination
-- Better performance
-- Easier certificate management
-- Can serve multiple applications
-
-### Setup
-
-1. **Install nginx**:
 ```bash
-sudo apt install nginx -y
+cd /opt
+sudo git clone <YOUR_REPO_URL> trading-app
+sudo chown -R $USER:$USER /opt/trading-app
+cd /opt/trading-app
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-2. **Configure nginx** (`/etc/nginx/sites-available/trading`):
-```nginx
+If your app uses a `.env` file, create it now.
+
+For IP-based access, if you set `ALLOWED_HOSTS`, include the public IP:
+
+```env
+ALLOWED_HOSTS=YOUR_STATIC_IP,localhost,127.0.0.1
+```
+
+If you leave `ALLOWED_HOSTS` unset, the app currently defaults to `*`.
+
+---
+
+## Step 7: Test the App on Localhost
+
+Start the app once to verify it boots:
+
+```bash
+cd /opt/trading-app
+source .venv/bin/activate
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+From the VM:
+
+```bash
+curl http://127.0.0.1:8000/
+```
+
+Stop it after the test.
+
+---
+
+## Step 8: Create a systemd Service
+
+Create the service file:
+
+```bash
+sudo tee /etc/systemd/system/trading.service > /dev/null <<'EOF'
+[Unit]
+Description=Trading FastAPI App
+After=network.target redis-server.service
+
+[Service]
+User=YOUR_LINUX_USER
+Group=YOUR_LINUX_USER
+WorkingDirectory=/opt/trading-app
+EnvironmentFile=-/opt/trading-app/.env
+ExecStart=/opt/trading-app/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+Replace `YOUR_LINUX_USER` with your Linux username, for example:
+
+```ini
+User=ubuntu
+Group=ubuntu
+```
+
+Then enable and start it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable redis-server
+sudo systemctl enable trading
+sudo systemctl start trading
+sudo systemctl status trading
+```
+
+Check logs if needed:
+
+```bash
+sudo journalctl -u trading -f
+```
+
+---
+
+## Step 9: Configure nginx for HTTP First
+
+Create a folder for ACME challenges:
+
+```bash
+sudo mkdir -p /var/www/certbot
+sudo chown -R www-data:www-data /var/www/certbot
+```
+
+Create an HTTP-only nginx config first:
+
+```bash
+sudo tee /etc/nginx/sites-available/trading > /dev/null <<'EOF'
 server {
     listen 80;
-    server_name trading.yourdomain.com;
-    
-    # Redirect HTTP to HTTPS
-    return 301 https://$server_name$request_uri;
-}
+    listen [::]:80;
+    server_name YOUR_STATIC_IP;
 
-server {
-    listen 443 ssl http2;
-    server_name trading.yourdomain.com;
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
 
-    # SSL certificate
-    ssl_certificate /etc/letsencrypt/live/trading.yourdomain.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/trading.yourdomain.com/privkey.pem;
-    
-    # SSL settings
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    ssl_prefer_server_ciphers on;
-
-    # Proxy to your app
     location / {
         proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        
-        # WebSocket support
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Connection "upgrade";
     }
 }
+EOF
 ```
 
-> Note: For `proxy_set_header Connection $connection_upgrade;` you should define this once in your nginx `http {}` context:
->
-> ```nginx
-> map $http_upgrade $connection_upgrade {
->     default upgrade;
->     ''      close;
-> }
-> ```
+Replace `YOUR_STATIC_IP` in the file, then enable the site:
 
-3. **Enable site and restart nginx**:
 ```bash
-sudo ln -s /etc/nginx/sites-available/trading /etc/nginx/sites-enabled/
+sudo ln -sf /etc/nginx/sites-available/trading /etc/nginx/sites-enabled/trading
+sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t
 sudo systemctl restart nginx
 ```
 
-4. **Start your app on HTTP** (nginx handles HTTPS):
+Now test:
+
 ```bash
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+curl http://YOUR_STATIC_IP/
+```
+
+---
+
+## Step 10: Obtain a Trusted SSL Certificate for the IP Address
+
+Use Certbot in `webroot` mode.
+
+Important:
+
+- Use a recent Certbot version.
+- For IP certificates, the `nginx` installer plugin is not the path to use here.
+- Keep port 80 open during validation.
+
+Run:
+
+```bash
+sudo certbot certonly \
+  --webroot \
+  --webroot-path /var/www/certbot \
+  --ip-address YOUR_STATIC_IP \
+  --preferred-profile shortlived \
+  -m YOUR_EMAIL \
+  --agree-tos
+```
+
+Certificates will be stored at:
+
+```text
+/etc/letsencrypt/live/YOUR_STATIC_IP/fullchain.pem
+/etc/letsencrypt/live/YOUR_STATIC_IP/privkey.pem
+```
+
+If issuance fails:
+
+- Make sure port `80` is reachable from the internet.
+- Make sure nginx is serving `/.well-known/acme-challenge/`.
+- Make sure `certbot --version` is recent enough.
+
+---
+
+## Step 11: Switch nginx to HTTPS
+
+Replace the nginx config with:
+
+```bash
+sudo tee /etc/nginx/sites-available/trading > /dev/null <<'EOF'
+server {
+    listen 80;
+    listen [::]:80;
+    server_name YOUR_STATIC_IP;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name YOUR_STATIC_IP;
+
+    ssl_certificate /etc/letsencrypt/live/YOUR_STATIC_IP/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/YOUR_STATIC_IP/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_timeout 10m;
+    ssl_session_cache shared:SSL:10m;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+
+    location /ws/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_buffering off;
+    }
+}
+EOF
+```
+
+Replace `YOUR_STATIC_IP` in the file, then reload nginx:
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+---
+
+## Step 12: Verify HTTPS
+
+Test in browser:
+
+```text
+https://YOUR_STATIC_IP/?user_id=1
+```
+
+Test from terminal:
+
+```bash
+curl -I https://YOUR_STATIC_IP/
+```
+
+If you want to inspect the presented certificate:
+
+```bash
+echo | openssl s_client -connect YOUR_STATIC_IP:443 -servername YOUR_STATIC_IP
+```
+
+---
+
+## Step 13: Configure Automatic Certificate Renewal
+
+IP certificates are short-lived, so do not skip this step.
+
+Create a deploy hook so nginx reloads after renewal:
+
+```bash
+sudo mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh > /dev/null <<'EOF'
+#!/bin/sh
+systemctl reload nginx
+EOF
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+```
+
+Enable Certbot's timer:
+
+```bash
+sudo systemctl enable --now snap.certbot.renew.timer
+sudo systemctl status snap.certbot.renew.timer
+```
+
+Test renewal:
+
+```bash
+sudo certbot renew --dry-run
+```
+
+---
+
+## URLs to Use
+
+Dashboard:
+
+```text
+https://YOUR_STATIC_IP/?user_id=1
+```
+
+Webhook:
+
+```text
+https://YOUR_STATIC_IP/webhook/chartink?user_id=1
+```
+
+API examples:
+
+```text
+https://YOUR_STATIC_IP/api/alerts?user_id=1
+https://YOUR_STATIC_IP/api/positions?user_id=1
 ```
 
 ---
 
 ## Troubleshooting
 
-### Browser Shows "Not Secure" Warning
+### 1. Browser says certificate is invalid
 
-**For self-signed certificates**: This is expected. Click "Advanced" → "Proceed" for testing.
+Check:
 
-**For Let's Encrypt**: Check that:
-- Certificate is valid: `sudo certbot certificates`
-- Domain points to your server IP
-- Firewall allows port 443
+- `sudo certbot certificates`
+- `sudo nginx -t`
+- `sudo systemctl status nginx`
+- `echo | openssl s_client -connect YOUR_STATIC_IP:443 -servername YOUR_STATIC_IP`
 
-### Zerodha Rejects Webhook URL
+### 2. Certbot cannot validate the IP
 
-- Self-signed certificates won't work - use Let's Encrypt
-- Ensure webhook URL uses HTTPS (not HTTP)
-- Test webhook manually: `curl -X POST https://yoururl.com/webhook/chartink?user_id=1 -d '{}'`
+Check:
 
-### Certificate Installation Failed
+- Port `80` is allowed in GCP firewall
+- nginx is running
+- `curl http://YOUR_STATIC_IP/.well-known/acme-challenge/test`
+- The instance is actually using the reserved static IP
 
-```bash
-# Check Certbot logs
-sudo cat /var/log/letsencrypt/letsencrypt.log
+### 3. Dashboard opens but API/websocket fails
 
-# Ensure port 80 is accessible
-sudo ufw allow 80
-sudo ufw allow 443
+Check:
+
+- `sudo journalctl -u trading -f`
+- `sudo tail -f /var/log/nginx/error.log`
+- App is listening on `127.0.0.1:8000`
+
+### 4. Host header blocked
+
+If you configure `ALLOWED_HOSTS`, include:
+
+```env
+ALLOWED_HOSTS=YOUR_STATIC_IP,localhost,127.0.0.1
 ```
 
-### Permission Denied on Port 443
+### 5. Third-party webhook still rejects IP URL
 
-Port 443 requires root privileges:
-- Use `sudo` to run the application
-- Or use nginx reverse proxy (recommended)
-- Or use port forwarding: `sudo iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to-port 8000`
+That is usually a provider policy issue, not a TLS issue. In that case use:
 
----
-
-## Security Best Practices
-
-1. **Never commit SSL keys to git**
-   - Add `*.pem` and `*.key` to `.gitignore`
-
-2. **Use strong SSL settings**
-   - TLS 1.2 or higher only
-   - Strong cipher suites
-
-3. **Keep certificates updated**
-   - Monitor expiration dates
-   - Enable auto-renewal
-
-4. **Restrict access**
-   - Use firewall rules
-   - Only open necessary ports
+- A real domain name
+- The same nginx reverse proxy flow
+- A normal domain-based Let's Encrypt certificate
 
 ---
 
-## Support
+## Simple Fallback Option
 
-- **Let's Encrypt**: https://letsencrypt.org/docs/
-- **Certbot**: https://certbot.eff.org/
-- **SSL Labs Test**: https://www.ssllabs.com/ssltest/
+If you only want browser testing and do not need a publicly trusted certificate, you can still use the local self-signed flow from this repository:
 
-For help with this application, check the main README.md
+```bash
+python generate_ssl_cert.py
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --ssl-keyfile=ssl_key.pem --ssl-certfile=ssl_cert.pem
+```
+
+Use this only for testing. For production webhooks, prefer a trusted certificate.
