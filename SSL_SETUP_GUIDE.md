@@ -20,6 +20,32 @@ Your webhook URL will be:
 https://YOUR_STATIC_IP/webhook/chartink?user_id=1
 ```
 
+## Beginner Defaults
+
+If you are just starting, use these exact values:
+
+- GCP region: `asia-south1` (Mumbai)
+- GCP zone: `asia-south1-a`
+- VM name: `trading-vm`
+- Static IP name: `trading-ip`
+- Firewall tag: `trading-server`
+- Machine type: `e2-medium`
+- OS image: `Ubuntu 22.04 LTS`
+- App folder on server: `/opt/trading-app`
+
+Your GitHub clone URL for this project:
+
+```text
+https://github.com/vknowledge-123/saurabmisra.git
+```
+
+If you follow this guide exactly, you only need to replace these values later:
+
+- `YOUR_STATIC_IP`
+- `YOUR_PUBLIC_IP`
+- `YOUR_EMAIL`
+- `YOUR_LINUX_USER`
+
 ## Important Notes
 
 1. You do not need a domain for this setup.
@@ -50,6 +76,16 @@ uvicorn app.main:app
 
 ## Step 1: Reserve a Static External IP
 
+If you are a beginner, the easiest path is:
+
+1. Open GCP Console.
+2. Create a project if you do not already have one.
+3. Enable billing for the project.
+4. Open `Compute Engine`.
+5. Click `VM instances` and enable the API if prompted.
+6. Open `VPC network` -> `IP addresses`.
+7. Reserve a new static external IP named `trading-ip` in region `asia-south1`.
+
 Choose your region first. Example:
 
 - Region: `asia-south1`
@@ -76,6 +112,25 @@ Save that value as `YOUR_STATIC_IP`.
 
 ## Step 2: Create the VM and Attach the Static IP
 
+### GCP Console Method
+
+1. Open `Compute Engine` -> `VM instances`.
+2. Click `Create Instance`.
+3. Set `Name` to `trading-vm`.
+4. Set `Region` to `Mumbai (asia-south1)`.
+5. Set `Zone` to `asia-south1-a`.
+6. Set `Machine configuration` to `E2`.
+7. Set `Machine type` to `e2-medium`.
+8. Under `Boot disk`, click `Change`.
+9. Choose `Ubuntu`.
+10. Choose `Ubuntu 22.04 LTS`.
+11. Set disk size to `30 GB`.
+12. Under `Networking`, choose the reserved external IP `trading-ip`.
+13. In `Network tags`, add `trading-server`.
+14. Click `Create`.
+
+Wait until the VM status shows `Running`.
+
 Create an Ubuntu VM:
 
 ```bash
@@ -94,6 +149,30 @@ If the VM already exists, you can reassign the reserved IP later from the GCP co
 ---
 
 ## Step 3: Open Firewall Ports
+
+### GCP Console Method
+
+1. Open `VPC network` -> `Firewall`.
+2. Click `Create Firewall Rule`.
+3. Create one rule named `trading-allow-web`.
+4. Direction: `Ingress`.
+5. Targets: `Specified target tags`.
+6. Target tags: `trading-server`.
+7. Source IPv4 ranges: `0.0.0.0/0`.
+8. Protocols and ports: choose `Specified protocols and ports`.
+9. Enter `tcp:80,tcp:443`.
+10. Save.
+
+Now create another rule for SSH:
+
+1. Click `Create Firewall Rule`.
+2. Name: `trading-allow-ssh`.
+3. Direction: `Ingress`.
+4. Targets: `Specified target tags`.
+5. Target tags: `trading-server`.
+6. Source IPv4 ranges: your own internet IP with `/32`.
+7. Protocols and ports: `tcp:22`.
+8. Save.
 
 Allow web traffic:
 
@@ -118,6 +197,15 @@ If you need temporary open SSH access for setup, you can widen it and tighten it
 ---
 
 ## Step 4: SSH Into the VM
+
+### GCP Console Method
+
+1. Go to `Compute Engine` -> `VM instances`.
+2. Find `trading-vm`.
+3. Click the `SSH` button in the row.
+4. A browser terminal will open.
+
+From now on, almost everything below runs inside that SSH terminal.
 
 ```bash
 gcloud compute ssh trading-vm --zone=asia-south1-a
@@ -144,6 +232,13 @@ sudo ln -sf /snap/bin/certbot /usr/bin/certbot
 certbot --version
 ```
 
+You can also check Redis and nginx status:
+
+```bash
+sudo systemctl status redis-server
+sudo systemctl status nginx
+```
+
 ---
 
 ## Step 6: Deploy the App Code
@@ -152,7 +247,7 @@ Clone the repository and install Python dependencies:
 
 ```bash
 cd /opt
-sudo git clone <YOUR_REPO_URL> trading-app
+sudo git clone https://github.com/vknowledge-123/saurabmisra.git trading-app
 sudo chown -R $USER:$USER /opt/trading-app
 cd /opt/trading-app
 
@@ -163,6 +258,20 @@ pip install -r requirements.txt
 ```
 
 If your app uses a `.env` file, create it now.
+
+Create a starter `.env` file:
+
+```bash
+cat > /opt/trading-app/.env <<'EOF'
+ALLOWED_HOSTS=YOUR_STATIC_IP,localhost,127.0.0.1
+EOF
+```
+
+You can edit it later with:
+
+```bash
+nano /opt/trading-app/.env
+```
 
 For IP-based access, if you set `ALLOWED_HOSTS`, include the public IP:
 
@@ -191,6 +300,12 @@ curl http://127.0.0.1:8000/
 ```
 
 Stop it after the test.
+
+To stop it, press:
+
+```text
+Ctrl+C
+```
 
 ---
 
@@ -235,13 +350,97 @@ sudo systemctl start trading
 sudo systemctl status trading
 ```
 
+If the service does not start, inspect the logs:
+
+```bash
+sudo journalctl -u trading -n 100 --no-pager
+```
+
 Check logs if needed:
 
 ```bash
 sudo journalctl -u trading -f
 ```
 
----
+## Step 8A: Make `REFRESH SYSTEM` Work on GCP
+
+On GCP, the dashboard button calls:
+
+```text
+POST /api/service/restart
+```
+
+If you want that button to restart your real Linux services, do not leave it on the default fallback mode. Configure it explicitly.
+
+### 1. Enable restart from the app environment
+
+Add these lines to `/opt/trading-app/.env`:
+
+```env
+ENABLE_SERVICE_RESTART=1
+SERVICE_RESTART_TOKEN=replace-with-a-long-random-secret
+TRADING_RESTART_CMD=/usr/bin/sudo /usr/local/bin/restart-trading-stack.sh
+```
+
+If you need to restart more than one unit, also add:
+
+```env
+TRADING_STACK_UNITS=trading.service redis-server.service
+```
+
+### 2. Install the helper script as a root-owned file
+
+Copy the repository helper script into a root-owned location:
+
+```bash
+sudo cp /opt/trading-app/restart_trading_stack.sh /usr/local/bin/restart-trading-stack.sh
+sudo chown root:root /usr/local/bin/restart-trading-stack.sh
+sudo chmod 750 /usr/local/bin/restart-trading-stack.sh
+```
+
+Important:
+
+- Do not grant `sudo` access to a script that is still writable by your app user.
+- Keeping it root-owned prevents privilege escalation.
+
+### 3. Allow only that one command through sudo
+
+Replace `YOUR_LINUX_USER` with the same Linux user used in `trading.service`:
+
+```bash
+echo 'YOUR_LINUX_USER ALL=(root) NOPASSWD: /usr/local/bin/restart-trading-stack.sh' | sudo tee /etc/sudoers.d/trading-restart
+sudo chmod 440 /etc/sudoers.d/trading-restart
+sudo visudo -cf /etc/sudoers.d/trading-restart
+```
+
+### 4. Reload and restart the trading app once
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart trading.service
+```
+
+### 5. Test the same command manually before using the button
+
+Run this as your app user:
+
+```bash
+sudo /usr/local/bin/restart-trading-stack.sh
+```
+
+If you configured multiple units:
+
+```bash
+sudo TRADING_STACK_UNITS="trading.service redis-server.service" /usr/local/bin/restart-trading-stack.sh
+```
+
+Only after this works should you use `REFRESH SYSTEM` in the dashboard.
+
+### 6. What the button now tells you
+
+The backend now checks whether the restart command exited successfully. If `systemctl` or `sudo` is denied, the API response will return an error instead of a false success message.
+
+--- 
 
 ## Step 9: Configure nginx for HTTP First
 
@@ -294,6 +493,8 @@ Now test:
 curl http://YOUR_STATIC_IP/
 ```
 
+If this works in your browser, your app is publicly reachable on normal HTTP.
+
 ---
 
 ## Step 10: Obtain a Trusted SSL Certificate for the IP Address
@@ -330,6 +531,8 @@ If issuance fails:
 - Make sure port `80` is reachable from the internet.
 - Make sure nginx is serving `/.well-known/acme-challenge/`.
 - Make sure `certbot --version` is recent enough.
+
+If Certbot prints an error, do not continue to HTTPS until that step succeeds.
 
 ---
 
@@ -422,6 +625,14 @@ Test from terminal:
 ```bash
 curl -I https://YOUR_STATIC_IP/
 ```
+
+Open in browser:
+
+```text
+https://YOUR_STATIC_IP/?user_id=1
+```
+
+If the browser opens without a certificate warning, SSL is working.
 
 If you want to inspect the presented certificate:
 
@@ -540,3 +751,31 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --ssl-keyfile=ssl_key.
 ```
 
 Use this only for testing. For production webhooks, prefer a trusted certificate.
+
+---
+
+## Beginner Checklist
+
+Use this as your quick checklist:
+
+1. Create GCP project.
+2. Enable billing.
+3. Reserve static IP `trading-ip` in Mumbai region `asia-south1`.
+4. Create VM `trading-vm` in zone `asia-south1-a`.
+5. Attach static IP to VM.
+6. Add network tag `trading-server`.
+7. Open firewall ports `80`, `443`, and `22`.
+8. SSH into the VM.
+9. Install packages.
+10. Clone `https://github.com/vknowledge-123/saurabmisra.git` into `/opt/trading-app`.
+11. Create Python virtual environment.
+12. Install Python requirements.
+13. Create `.env` with `ALLOWED_HOSTS=YOUR_STATIC_IP,localhost,127.0.0.1`.
+14. Test app locally with Uvicorn.
+15. Create `systemd` service.
+16. Configure nginx for HTTP.
+17. Test `http://YOUR_STATIC_IP/`.
+18. Run Certbot for the IP certificate.
+19. Configure nginx for HTTPS.
+20. Test `https://YOUR_STATIC_IP/?user_id=1`.
+21. Enable certificate auto-renewal.

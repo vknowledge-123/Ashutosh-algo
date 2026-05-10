@@ -1503,7 +1503,8 @@
       try {
         const r = await (await fetch(`/api/zerodha-status?user_id=${USER_ID}`)).json();
         if (r.connected) {
-        el.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)] inline-block mr-1.5"></span> KITE CONNECTED`;
+        const label = r.ticker_connected ? "KITE CONNECTED" : "KITE AUTH OK";
+        el.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)] inline-block mr-1.5"></span> ${label}`;
           el.className = "px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 shadow-[0_0_10px_rgba(16,185,129,0.2)] transition-all";
         } else {
           throw new Error('Disconnected');

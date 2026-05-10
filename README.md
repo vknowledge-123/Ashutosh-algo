@@ -142,14 +142,26 @@ Exit triggers update Redis and UI status.
 
 ## 8) Restart System Button (Backend)
 - Button ? `POST /api/service/restart`
-- Backend launches system command in background
-- Dashboard stays responsive (no -15 error now)
+- Backend runs the configured restart command and now checks whether it succeeded
+- For Linux/GCP, the command should return quickly, for example by using `systemctl --no-block`
 
 Env vars:
 ```
 ENABLE_SERVICE_RESTART=1
 TRADING_RESTART_CMD=/bin/systemctl restart trading.service
 ```
+
+Recommended for GCP/systemd:
+```
+ENABLE_SERVICE_RESTART=1
+SERVICE_RESTART_TOKEN=change-this-to-a-long-random-value
+TRADING_RESTART_CMD=/usr/bin/sudo /usr/local/bin/restart-trading-stack.sh
+```
+
+Notes:
+- If your app runs as a non-root Linux user, direct `systemctl restart ...` usually fails from the web request.
+- Use a root-owned helper script plus a narrow `sudoers` rule instead.
+- The helper can restart one or more units, for example `trading.service redis-server.service`.
 
 ---
 

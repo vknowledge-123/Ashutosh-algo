@@ -121,6 +121,7 @@ ENABLE_SERVICE_RESTART = (os.getenv("ENABLE_SERVICE_RESTART") or "").strip().low
 SERVICE_RESTART_TOKEN = (os.getenv("SERVICE_RESTART_TOKEN") or "").strip()
 TRADING_SYSTEMD_UNIT = (os.getenv("TRADING_SYSTEMD_UNIT") or "trading").strip()
 TRADING_RESTART_CMD = (os.getenv("TRADING_RESTART_CMD") or f"systemctl restart --no-block {TRADING_SYSTEMD_UNIT}").strip()
+TRADING_RESTART_TIMEOUT_SEC = float((os.getenv("TRADING_RESTART_TIMEOUT_SEC") or "15").strip() or "15")
 
 
 def _is_test_mode() -> bool:
@@ -128,6 +129,45 @@ def _is_test_mode() -> bool:
     if v in {"1", "true", "yes", "on"}:
         return True
     return (os.getenv("APP_ENV") or "").strip().lower() == "test"
+
+
+def _run_restart_command(cmd: str) -> Dict[str, Any]:
+    """
+    Execute the configured restart command and wait briefly for acceptance/failure.
+    The command should return quickly, for example by using `systemctl --no-block`.
+    """
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return {"ok": False, "error": "TRADING_RESTART_CMD_EMPTY"}
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, TRADING_RESTART_TIMEOUT_SEC),
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "error": f"RESTART_TIMEOUT_AFTER_{int(max(1.0, TRADING_RESTART_TIMEOUT_SEC))}S",
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"RESTART_SPAWN_FAILED:{e}"}
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        if detail:
+            detail = detail.replace("\r", " ").replace("\n", " ")[:400]
+        return {
+            "ok": False,
+            "error": f"RESTART_CMD_FAILED:{proc.returncode}",
+            "detail": detail or "Command returned non-zero exit code",
+        }
+
+    detail = (proc.stdout or "").strip()
+    return {"ok": True, "detail": detail[:400] if detail else ""}
 
 app = FastAPI(title="AlgoEdge Ultra-Low Latency")
 app.state.limiter = limiter
@@ -888,13 +928,24 @@ async def zerodha_status(user_id: int = 1):
     session_ok = await is_session_valid(user_id)
     kill = await store.is_kill(user_id)
 
-    connected = bool(
-        session_ok
-        and KT_CONNECTED
-        and KT_USER_ID == user_id
-    )
+    ticker_connected = bool(KT_CONNECTED and KT_USER_ID == user_id)
+
+    # A valid auth session means Kite login succeeded, even if the background
+    # ticker thread is still reconnecting. When that happens, try to self-heal.
+    if session_ok and not ticker_connected and not _is_test_mode():
+        try:
+            eng = await ensure_engine(user_id)
+            await eng.configure_kite()
+            await _stop_kite_ticker()
+            await start_kite_ticker(user_id)
+        except Exception as e:
+            print(f"[KT] status self-heal failed for user={user_id}: {e}")
+
+        ticker_connected = bool(KT_CONNECTED and KT_USER_ID == user_id)
+
     return {
-        "connected": connected,
+        "connected": bool(session_ok),
+        "ticker_connected": ticker_connected,
         "kill_switch": kill
     }
 
@@ -1289,6 +1340,8 @@ async def api_restart_service(
     if not ENABLE_SERVICE_RESTART:
         # Fallback: soft restart ticker to pick up new tokens without full service restart.
         user_id = int(payload.get("user_id", 1))
+        eng = await ensure_engine(user_id)
+        await eng.configure_kite()
         await _stop_kite_ticker()
         await start_kite_ticker(user_id)
         return {"ok": True, "message": "Ticker restarted (service restart disabled)"}
@@ -1300,24 +1353,19 @@ async def api_restart_service(
         # Allow Windows only if TRADING_RESTART_CMD is explicitly set to a non-systemctl command.
         if not TRADING_RESTART_CMD or "systemctl" in TRADING_RESTART_CMD.lower():
             user_id = int(payload.get("user_id", 1))
+            eng = await ensure_engine(user_id)
+            await eng.configure_kite()
             await _stop_kite_ticker()
             await start_kite_ticker(user_id)
             return {"ok": True, "message": "Ticker restarted (Windows fallback)"}
 
     cmd = TRADING_RESTART_CMD
 
-    try:
-        # Fire-and-forget so the HTTP response can return before the service restarts.
-        subprocess.Popen(
-            cmd,
-            shell=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as e:
-        return {"ok": False, "error": f"SPAWN_FAILED:{e}"}
+    result = _run_restart_command(cmd)
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("error"), "detail": result.get("detail", "")}
 
-    return {"ok": True, "message": "Restart requested"}
+    return {"ok": True, "message": "Restart requested", "detail": result.get("detail", "")}
 
 
 # -----------------------------
